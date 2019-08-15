@@ -1,24 +1,132 @@
 ﻿using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using UnityEngine;
 
-public class TerrainGenerator : MonoBehaviour
-{
-    [Header ("Mesh")]
-    public int map_size = 256;
-    public float elevation_scale = 5;
-    public float scale = 1000;
-    public Material material;
+public class TerrainGenerator : MonoBehaviour {
 
-    [Header("Noise")]
+    [Header("Chunk")]
+    public int chunk_amount = 8;
+    private Chunk[] chunks;
+
+    public float chunk_scale = 2500;
+    public float chunk_elevation_scale = 1000;
+    public int chunk_node_count = 128;
+    public int heightmap_node_count;
+    public Material chunk_material;
+
+    System.Random prng;
     public int seed;
-    public bool randomizeSeed;
-    public int numOctaves = 7;
+    public bool randomize_seed;
+
+    void Start() {
+        heightmap_node_count = chunk_node_count * chunk_amount;
+
+        // Seed
+        if (randomize_seed || prng == null) {
+            seed = (randomize_seed) ? Random.Range(-10000, 10000) : seed;
+            prng = new System.Random(seed);
+        }
+        Stopwatch sw = new Stopwatch();
+
+        sw.Start();
+        heightmap = GenerateHeightmap(heightmap_node_count);
+        sw.Stop();
+        print("Heightmap generated: " + sw.ElapsedMilliseconds + "ms");
+
+        sw.Restart();
+        Erode(heightmap, heightmap_node_count, erosion_iterations);
+        sw.Stop();
+        print("Erosion completed: " + sw.ElapsedMilliseconds + "ms");
+
+        sw.Restart();
+        chunks = GenerateChunks(heightmap, heightmap_node_count, chunk_amount, chunk_node_count, chunk_scale, chunk_elevation_scale, chunk_material);
+        sw.Stop();
+        print("Chunks generated: " + sw.ElapsedMilliseconds + "ms");
+    }
+
+    private Chunk[] GenerateChunks(float[] heightmap, int heightmap_node_count, int chunk_amount, int chunk_node_count, float chunk_scale, float chunk_elevation_scale, Material chunk_material) {
+
+        var chunks = new Chunk[chunk_amount * chunk_amount];
+
+        for (int y = 0; y < chunk_amount; y++) {
+            for (int x = 0; x < chunk_amount; x++) {
+                int i = y * chunk_amount + x;
+                var go = new GameObject();
+                go.name = string.Format(x + "," + y);
+                go.transform.position = new Vector3((x - chunk_amount/2) * chunk_scale, 0, (y - chunk_amount/2) * chunk_scale);
+                go.transform.parent = transform;
+                chunks[i] = go.AddComponent<Chunk>();
+                chunks[i].GenerateMesh(heightmap, heightmap_node_count, new Vector2Int(x * (chunk_node_count - 1), y * (chunk_node_count - 1)), chunk_material, chunk_node_count, chunk_scale, chunk_elevation_scale);
+            }
+        }
+        return chunks;
+    }
+
+    #region HEIGHTMAP
+    [Header("Heightmap")]
+
+    private float[] heightmap;
+    public int num_octaves = 7;
     public float persistence = .5f;
     public float lacunarity = 2;
-    public float initialScale = 2;
+    public float initial_scale = 2;
 
-    [Header ("Erosion")]
+    public float[] GenerateHeightmap(int node_count) {
+        var map = new float[node_count * node_count];
+
+        Vector2[] offsets = new Vector2[num_octaves];
+        for (int i = 0; i < num_octaves; i++) {
+            offsets[i] = new Vector2(prng.Next(-1000, 1000), prng.Next(-1000, 1000));
+        }
+
+        float min_value = 0;
+        float max_value = 1;
+
+        for (int y = 0; y < node_count; y++) {
+            for (int x = 0; x < node_count; x++) {
+                float noise_value = 0;
+                float noise_scale = initial_scale;
+                float weight = 1;
+
+                for (int i = 0; i < num_octaves; i++) {
+                    Vector2 p = offsets[i];
+                    var factor = 2500.0f / 10000.0f;
+                    p += new Vector2(x / (float)node_count, y / (float)node_count) * noise_scale;
+
+                    noise_value += Mathf.PerlinNoise(p.x, p.y) * weight;
+                    weight *= persistence;
+                    noise_scale *= lacunarity;
+                }
+                map[y * node_count + x] = noise_value;
+                min_value = noise_value < min_value ? min_value : noise_value;
+                max_value = noise_value > max_value ? max_value : noise_value;
+            }
+        }
+
+
+        for (int i = 0; i < map.Length; i++) {
+            //Normalize
+            map[i] = (map[i] - min_value) / (max_value - min_value);
+
+            // Circle to make an island
+
+            var x = i % node_count;
+            var y = i / node_count;
+
+            var dist_x = Mathf.Pow(node_count / 2.0f - x, 2);
+            var dist_y = Mathf.Pow(node_count / 2.0f - y, 2);
+            float distance_to_center = Mathf.Sqrt(dist_x + dist_y) / (float)node_count;
+            map[i] *= 1 - distance_to_center;
+
+        }
+        return map;
+    }
+    #endregion
+
+    #region EROSION
+    [Header("Erosion")]
+
     public int erosion_iterations = 10000;
 
     [Range(2, 8)]
@@ -39,169 +147,39 @@ public class TerrainGenerator : MonoBehaviour
     public float initialWaterVolume = 1;
     public float initialSpeed = 1;
 
-    public GameObject sphere;
-
     // Indices and weights of erosion brush precomputed for every node
     int[][] erosionBrushIndices;
     float[][] erosionBrushWeights;
-    System.Random prng;
 
-    int currentSeed;
-    int currentErosionRadius;
-    int currentMapSize;
-
-    float[] map;
-    Mesh mesh;
-
-    MeshRenderer mesh_renderer;
-    MeshFilter mesh_filter;
-
-    // Start is called before the first frame update
-    void Start()
-    {
-        if (!gameObject.GetComponent<MeshRenderer>()) {
-            mesh_renderer = gameObject.AddComponent<MeshRenderer>();
+    void InitializeErosion(int node_count) {
+        if (erosionBrushIndices == null) {
+            InitializeBrushIndices(node_count, erosionRadius);
         }
-
-        if (!gameObject.GetComponent<MeshFilter>()) {
-            mesh_filter = gameObject.AddComponent<MeshFilter>();
-        }
-
-        map = GenerateNoise(map_size);
-        Erode(map, map_size, erosion_iterations);
-        GenerateMesh();
     }
 
-    // Update is called once per frame
-    void Update()
-    {
-        
-    }
+    public void Erode(float[] map, int node_count, int iterations_amount = 1) {
+        InitializeErosion(node_count);
 
-    void GenerateMesh() {
-        Vector3[] verts = new Vector3[map_size * map_size];
-        int[] triangles = new int[(map_size - 1) * (map_size - 1) * 6];
-        int t = 0;
-
-        for (int y = 0; y < map_size; y++) {
-            for (int x = 0; x < map_size; x++) {
-                int i = y * map_size + x;
-
-                Vector2 percent = new Vector2(x / (map_size - 1f), y / (map_size - 1f));
-                Vector3 pos = new Vector3(percent.x, 0, percent.y) * scale;
-                pos += Vector3.up * map[i] * elevation_scale;
-                verts[i] = pos;
-
-                // Construct triangles
-                if (x != map_size - 1 && y != map_size - 1) {
-
-                    triangles[t + 0] = i + map_size;
-                    triangles[t + 1] = i + map_size + 1;
-                    triangles[t + 2] = i;
-
-                    triangles[t + 3] = i + map_size + 1;
-                    triangles[t + 4] = i + 1;
-                    triangles[t + 5] = i;
-                    t += 6;
-                }
-            }
-        }
-
-        if (mesh == null) {
-            mesh = new Mesh();
-        } else {
-            mesh.Clear();
-        }
-
-        mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
-        mesh.vertices = verts;
-        mesh.triangles = triangles;
-        mesh.RecalculateNormals();
-
-        mesh_filter.sharedMesh = mesh;
-        mesh_renderer.sharedMaterial = material;
-        material.SetFloat("_MaxHeight", elevation_scale);
-    }
-
-    public float[] GenerateNoise(int mapSize) {
-        var map = new float[mapSize * mapSize];
-        seed = (randomizeSeed) ? Random.Range(-10000, 10000) : seed;
-        var prng = new System.Random(seed);
-
-        Vector2[] offsets = new Vector2[numOctaves];
-        for (int i = 0; i < numOctaves; i++) {
-            offsets[i] = new Vector2(prng.Next(-1000, 1000), prng.Next(-1000, 1000));
-        }
-
-        float minValue = float.MaxValue;
-        float maxValue = float.MinValue;
-
-        for (int y = 0; y < mapSize; y++) {
-            for (int x = 0; x < mapSize; x++) {
-                float noiseValue = 0;
-                float scale = initialScale;
-                float weight = 1;
-                for (int i = 0; i < numOctaves; i++) {
-                    Vector2 p = offsets[i] + new Vector2(x / (float)mapSize, y / (float)mapSize) * scale;
-                    noiseValue += Mathf.PerlinNoise(p.x, p.y) * weight;
-                    weight *= persistence;
-                    scale *= lacunarity;
-                }
-                map[y * mapSize + x] = noiseValue;
-                minValue = Mathf.Min(noiseValue, minValue);
-                maxValue = Mathf.Max(noiseValue, maxValue);
-            }
-        }
-
-        // Normalize
-        if (maxValue != minValue) {
-            for (int i = 0; i < map.Length; i++) {
-                map[i] = (map[i] - minValue) / (maxValue - minValue);
-            }
-        }
-
-        return map;
-    }
-
-    void InitializeErosion(int mapSize, bool resetSeed) {
-        if (resetSeed || prng == null || currentSeed != seed) {
-            prng = new System.Random(seed);
-            currentSeed = seed;
-        }
-
-        if (erosionBrushIndices == null || currentErosionRadius != erosionRadius || currentMapSize != mapSize) {
-            InitializeBrushIndices(mapSize, erosionRadius);
-            currentErosionRadius = erosionRadius;
-            currentMapSize = mapSize;
-        }
-
-    }
-
-    public void Erode(float[] map, int mapSize, int numIterations = 1, bool resetSeed = false) {
-        InitializeErosion(mapSize, false);
-
-        for (int iteration = 0; iteration < numIterations; iteration++) {
+        for (int iteration = 0; iteration < iterations_amount; iteration++) {
             // Create water droplet at random point on map
-            float posX = prng.Next(0, mapSize - 1);
-            float posY = prng.Next(0, mapSize - 1);
+            float posX = prng.Next(0, node_count - 1);
+            float posY = prng.Next(0, node_count - 1);
             float dirX = 0;
             float dirY = 0;
             float speed = initialSpeed;
             float water = initialWaterVolume;
             float sediment = 0;
 
-
-
             for (int lifetime = 0; lifetime < maxDropletLifetime; lifetime++) {
                 int nodeX = (int)posX;
                 int nodeY = (int)posY;
-                int dropletIndex = nodeY * mapSize + nodeX;
+                int dropletIndex = nodeY * node_count + nodeX;
                 // Calculate droplet's offset inside the cell (0,0) = at NW node, (1,1) = at SE node
                 float cellOffsetX = posX - nodeX;
                 float cellOffsetY = posY - nodeY;
 
                 // Calculate droplet's height and direction of flow with bilinear interpolation of surrounding heights
-                HeightAndGradient heightAndGradient = CalculateHeightAndGradient(map, mapSize, posX, posY);
+                HeightAndGradient heightAndGradient = CalculateHeightAndGradient(map, node_count, posX, posY);
 
                 // Update the droplet's direction and position (move position 1 unit regardless of speed)
                 dirX = (dirX * inertia - heightAndGradient.gradientX * (1 - inertia));
@@ -216,12 +194,12 @@ public class TerrainGenerator : MonoBehaviour
                 posY += dirY;
 
                 // Stop simulating droplet if it's not moving or has flowed over edge of map
-                if (posX < 0 || posX >= mapSize - 1 || posY < 0 || posY >= mapSize - 1) {
+                if (posX < 0 || posX >= node_count - 1 || posY < 0 || posY >= node_count - 1) {
                     break;
                 }
 
                 // Find the droplet's new height and calculate the deltaHeight
-                float newHeight = CalculateHeightAndGradient(map, mapSize, posX, posY).height;
+                float newHeight = CalculateHeightAndGradient(map, node_count, posX, posY).height;
                 float deltaHeight = newHeight - heightAndGradient.height;
 
                 // Calculate the droplet's sediment capacity (higher when moving fast down a slope and contains lots of water)
@@ -237,8 +215,8 @@ public class TerrainGenerator : MonoBehaviour
                     // Deposition is not distributed over a radius (like erosion) so that it can fill small pits
                     map[dropletIndex] += amountToDeposit * (1 - cellOffsetX) * (1 - cellOffsetY);
                     map[dropletIndex + 1] += amountToDeposit * cellOffsetX * (1 - cellOffsetY);
-                    map[dropletIndex + mapSize] += amountToDeposit * (1 - cellOffsetX) * cellOffsetY;
-                    map[dropletIndex + mapSize + 1] += amountToDeposit * cellOffsetX * cellOffsetY;
+                    map[dropletIndex + node_count] += amountToDeposit * (1 - cellOffsetX) * cellOffsetY;
+                    map[dropletIndex + node_count + 1] += amountToDeposit * cellOffsetX * cellOffsetY;
 
                 } else {
                     // Erode a fraction of the droplet's current carry capacity.
@@ -262,20 +240,20 @@ public class TerrainGenerator : MonoBehaviour
         }
     }
 
-    HeightAndGradient CalculateHeightAndGradient(float[] nodes, int mapSize, float posX, float posY) {
-        int coordX = (int)posX;
-        int coordY = (int)posY;
+    HeightAndGradient CalculateHeightAndGradient(float[] nodes, int node_count, float pos_x, float pos_y) {
+        int coord_x = (int)pos_x;
+        int coord_y = (int)pos_y;
 
         // Calculate droplet's offset inside the cell (0,0) = at NW node, (1,1) = at SE node
-        float x = posX - coordX;
-        float y = posY - coordY;
+        float x = pos_x - coord_x;
+        float y = pos_y - coord_y;
 
         // Calculate heights of the four nodes of the droplet's cell
-        int nodeIndexNW = coordY * mapSize + coordX;
+        int nodeIndexNW = coord_y * node_count + coord_x;
         float heightNW = nodes[nodeIndexNW];
         float heightNE = nodes[nodeIndexNW + 1];
-        float heightSW = nodes[nodeIndexNW + mapSize];
-        float heightSE = nodes[nodeIndexNW + mapSize + 1];
+        float heightSW = nodes[nodeIndexNW + node_count];
+        float heightSE = nodes[nodeIndexNW + node_count + 1];
 
         // Calculate droplet's direction of flow with bilinear interpolation of height difference along the edges
         float gradientX = (heightNE - heightNW) * (1 - y) + (heightSE - heightSW) * y;
@@ -340,5 +318,5 @@ public class TerrainGenerator : MonoBehaviour
         public float gradientX;
         public float gradientY;
     }
-
+    #endregion
 }
